@@ -1,0 +1,22 @@
+{
+  "total_examples": 58,
+  "models_used": {
+    "gpt4": 58
+  },
+  "difficulty_distribution": {
+    "hard": 18,
+    "easy": 24,
+    "medium": 16
+  },
+  "theme_distribution": {
+    "forest": 18,
+    "castle": 13,
+    "cave": 12,
+    "dungeon": 15
+  },
+  "size_distribution": {
+    "20x15": 26,
+    "25x20": 6,
+    "15x10": 26
+  }
+}
