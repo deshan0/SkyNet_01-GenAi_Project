@@ -1,16 +1,20 @@
 import json
 import random
 import re
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from src.llm_clients import LLMClient
-from src.game_objects import MapTiles, Position
-import time
+from datetime import datetime
+
+from .llm_clients import OpenAIClient, GeminiClient
+from .game_objects import GameLevel, Position, Enemy
 
 class RPGDataValidator:
     def __init__(self):
         self.validation_rules = {
-            "required_fields": ["width", "height", "walls", "enemies", "player_spawn"],  # Changed to player_spawn
+            "required_fields": ["width", "height", "difficulty", "theme", "player_spawn", "enemies", "terrain_map"],
+            "valid_difficulties": ["easy", "medium", "hard"],
+            "valid_themes": ["dungeon", "forest", "castle", "cave"],
             "valid_terrain_chars": ["B", ".", "P", "E", " "],
         }
     
@@ -30,129 +34,73 @@ class RPGDataValidator:
         except Exception as e:
             return None, [f"Unexpected error: {str(e)}"]
     
-    def validate_map(self, map_data: Dict, expected_width: int, expected_height: int) -> Tuple[bool, List[str]]:
-        """Validate a map data structure"""
+    def validate_level(self, level_data: Dict, expected_width: int, expected_height: int) -> Tuple[bool, List[str]]:
+        """Validate a level data structure"""
         errors = []
         
         # Check required fields
         for field in self.validation_rules["required_fields"]:
-            if field not in map_data:
+            if field not in level_data:
                 errors.append(f"Missing field: {field}")
         
         if errors:
             return False, errors
         
         # Basic validation
-        if map_data.get("width") != expected_width:
+        if level_data.get("width") != expected_width:
             errors.append(f"Width mismatch")
-        if map_data.get("height") != expected_height:
+        if level_data.get("height") != expected_height:
             errors.append(f"Height mismatch")
-        
-        # Check if player_spawn has x and y
-        player_spawn = map_data.get("player_spawn", {})
-        if not isinstance(player_spawn, dict) or "x" not in player_spawn or "y" not in player_spawn:
-            errors.append("Invalid player_spawn format")
+        if level_data.get("difficulty") not in self.validation_rules["valid_difficulties"]:
+            errors.append(f"Invalid difficulty")
         
         return len(errors) == 0, errors
 
 class RPGDataCollector:
-    def __init__(self, llm_clients: Dict[str, LLMClient], output_dir: str = "data/collected"):
+    def __init__(self, llm_clients: Dict[str, any], output_dir: str = "data/collected"):
         self.clients = llm_clients
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.validator = RPGDataValidator()
         
-    def create_map_prompt(self, width: int, height: int) -> str:
-        return f"""
-Generate a tilemap for a game level with these exact specifications:
+    def _create_prompt(self, width: int, height: int, difficulty: str, theme: str) -> str:
+        """Create a detailed prompt for RPG level generation"""
+        return f"""Generate a {theme} RPG level with these exact specifications:
 - Dimensions: {width} x {height}
-- All edges should be walls
-- Place ONE player (P) and multiple enemies (E)
-- Place some walls inside the level
-- Player should be able to reach all enemies
-- Player should be near the center
+- Difficulty: {difficulty}
+- Theme: {theme}
 
-Return ONLY a JSON object with this exact structure:
+Return ONLY a JSON object with this EXACT structure:
 {{
     "width": {width},
     "height": {height},
+    "difficulty": "{difficulty}",
+    "theme": "{theme}",
     "player_spawn": {{"x": <int>, "y": <int>}},
     "enemies": [
-        {{"x": <int>, "y": <int>}},
-        {{"x": <int>, "y": <int>}}
+        {{"x": <int>, "y": <int>, "type": "basic"}}
     ],
-    "walls": [
-        {{"x": <int>, "y": <int>}},
-        {{"x": <int>, "y": <int>}}
+    "terrain_map": [
+        ["B", "B", "B", "B", "..."],
+        ["B", ".", ".", ".", "..."],
+        ["B", ".", "P", ".", "..."],
+        ["B", ".", ".", "E", "..."],
+        ["B", "B", "B", "B", "..."]
     ]
 }}
 
 Rules:
-1. All edge positions must be walls
-2. Place 3-8 enemies randomly
-3. Make sure all areas are reachable from player position
-4. Use coordinates where (0,0) is top-left
-5. Player should be roughly in the center area
-"""
+- B = walls (all edges must be walls)
+- . = empty floor
+- P = player spawn (exactly one, must match player_spawn coordinates)
+- E = enemies (multiple allowed, must match enemies list)
+- The terrain_map must be COMPLETE with all {height} rows and {width} columns
+- All positions must be within bounds (0 to {width-1}, 0 to {height-1})"""
 
-    def collect_data(self, samples_per_model: int = 50) -> Dict[str, List]:
-        """Collect training data from all models"""
-        all_data = {}
+    def _parse_response(self, response: str, width: int, height: int, difficulty: str, theme: str) -> Optional[GameLevel]:
+        """Try to parse LLM response into GameLevel with validation"""
         
-        for model_name, client in self.clients.items():
-            print(f"\n🔄 Collecting data from {model_name}...")
-            model_data = []
-            
-            for i in range(samples_per_model):
-                # Random map sizes for variety
-                width, height = random.choice([(20, 15), (25, 20), (15, 12)])
-                
-                prompt = self.create_map_prompt(width, height)
-                
-                print(f"  Sample {i+1}/{samples_per_model}: {width}x{height} map")
-                
-                # Generate with retry logic
-                response = self._generate_with_retry(client, prompt)
-                if response:
-                    # Try to parse and validate
-                    map_tiles = self._parse_response(response, width, height)
-                    
-                    training_example = {
-                        "prompt": prompt,
-                        "response": response,
-                        "model": model_name,
-                        "parameters": {"width": width, "height": height},
-                        "valid": map_tiles is not None,
-                        "timestamp": time.time()
-                    }
-                    
-                    model_data.append(training_example)
-                    
-                    # Small delay to be nice to APIs
-                    time.sleep(1)
-            
-            all_data[model_name] = model_data
-            
-            # Save each model's data
-            self._save_data(model_name, model_data)
-            print(f"✅ Collected {len(model_data)} samples from {model_name}")
-        
-        return all_data
-    
-    def _generate_with_retry(self, client: LLMClient, prompt: str, max_retries: int = 3) -> str:
-        """Generate with retry logic"""
-        for attempt in range(max_retries):
-            response = client.generate(prompt)
-            if response:
-                return response
-            print(f"    Retry {attempt + 1}/{max_retries}")
-            time.sleep(2)
-        return None
-    
-    def _parse_response(self, response: str, width: int, height: int):
-        """Try to parse LLM response into MapTiles with validation"""
-        
-        # Use validator to parse JSON
+        # Use validator instead of manual parsing
         parsed_data, parse_errors = self.validator.validate_raw_response(response)
         
         if not parsed_data:
@@ -160,34 +108,109 @@ Rules:
             return None
         
         # Validate the structure
-        is_valid, validation_errors = self.validator.validate_map(parsed_data, width, height)
+        is_valid, validation_errors = self.validator.validate_level(parsed_data, width, height)
         
         if not is_valid:
             print(f"    Validation error: {validation_errors[0] if validation_errors else 'Unknown'}")
             return None
         
         try:
-            # Create MapTiles object
-            map_tiles = MapTiles(
+            # Create GameLevel
+            level = GameLevel(
                 width=parsed_data["width"],
                 height=parsed_data["height"],
-                player_spawn=Position(parsed_data["player_spawn"]["x"], parsed_data["player_spawn"]["y"]),  # Changed to player_spawn
-                enemies=[Position(e["x"], e["y"]) for e in parsed_data["enemies"]],
-                walls=[Position(w["x"], w["y"]) for w in parsed_data["walls"]]
+                difficulty=parsed_data["difficulty"],
+                theme=parsed_data["theme"],
+                player_spawn=Position(parsed_data["player_spawn"]["x"], parsed_data["player_spawn"]["y"]),
+                enemies=[Enemy(Position(e["x"], e["y"]), e.get("type", "basic")) for e in parsed_data["enemies"]],
+                walls=[],
+                terrain_map=parsed_data["terrain_map"]
             )
             
-            return map_tiles if map_tiles.validate() else None
+            return level if level.validate() else None
             
         except Exception as e:
-            print(f"    MapTiles creation error: {e}")
+            print(f"    GameLevel creation error: {e}")
             return None
-    
-    def _save_data(self, model_name: str, data: List):
-        """Save collected data"""
-        timestamp = int(time.time())
-        filename = self.output_dir / f"{model_name}_data_{timestamp}.json"
+
+    def _generate_with_retry(self, client, prompt: str) -> str:
+        """Generate with retry logic"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = client.generate(prompt)
+                return response
+            except Exception as e:
+                print(f"    API error (attempt {attempt+1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
+                raise
+
+    def collect_data(self, num_samples: int) -> Dict[str, List[Dict]]:
+        """Collect training data from all available models"""
+        all_data = {}
         
-        with open(filename, 'w') as f:
-            json.dump(data, f, indent=2)
+        for model_name, client in self.clients.items():
+            print(f"\n🔄 Collecting data from {model_name}...")
+            model_data = []
+            
+            for i in range(num_samples):
+                # Random parameters
+                width, height = random.choice([(15, 10), (20, 15), (25, 20)])
+                difficulty = random.choice(["easy", "medium", "hard"])
+                theme = random.choice(["dungeon", "forest", "castle", "cave"])
+                
+                print(f"  Sample {i+1}/{num_samples}: {width}x{height} {difficulty} {theme}")
+                
+                try:
+                    # Generate
+                    prompt = self._create_prompt(width, height, difficulty, theme)
+                    response = self._generate_with_retry(client, prompt)
+                    
+                    # Parse and validate
+                    level = self._parse_response(response, width, height, difficulty, theme)
+                    
+                    # Store result
+                    example = {
+                        "model": model_name,
+                        "parameters": {"width": width, "height": height, "difficulty": difficulty, "theme": theme},
+                        "prompt": prompt,
+                        "response": response,
+                        "parsed_level": level.to_dict() if level else None,
+                        "valid": level is not None,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    
+                    model_data.append(example)
+                    
+                except Exception as e:
+                    print(f"    Error: {e}")
+                    # Store failed example
+                    example = {
+                        "model": model_name,
+                        "parameters": {"width": width, "height": height, "difficulty": difficulty, "theme": theme},
+                        "prompt": prompt if 'prompt' in locals() else "",
+                        "response": "",
+                        "parsed_level": None,
+                        "valid": False,
+                        "error": str(e),
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    model_data.append(example)
+            
+            # Save model data
+            timestamp = int(time.time())
+            filename = f"{model_name}_data_{timestamp}.json"
+            filepath = self.output_dir / filename
+            
+            with open(filepath, 'w') as f:
+                json.dump(model_data, f, indent=2)
+            
+            valid_count = sum(1 for ex in model_data if ex["valid"])
+            print(f"📁 Saved to {filepath}")
+            print(f"✅ Collected {valid_count}/{len(model_data)} valid samples from {model_name}")
+            
+            all_data[model_name] = model_data
         
-        print(f"📁 Saved to {filename}")
+        return all_data
